@@ -15,7 +15,8 @@ unauthorized while device approval is on.
 exit code you can gate CI or a cron job on.
 
 **Read-only by construction.** The tool issues `GET` requests only. It has no code path that
-mutates a tailnet, and the API token it needs carries the `devices:core:read` OAuth scope.
+mutates a tailnet. The only permission it needs is the `devices:core:read` scope, although
+an API access token cannot be narrowed to that and carries its creator's full permissions.
 
 ## Scope
 
@@ -27,7 +28,7 @@ In scope:
 - Exit non-zero when findings reach a configured severity.
 
 Out of scope, deliberately: writing to the API, the policy-file (ACL) endpoints, OAuth
-client-credential exchange (a personal access token is enough for a read-only auditor),
+client-credential exchange (an API access token works, at the cost of over-privilege),
 persistence, and any kind of daemon mode.
 
 ## API contract

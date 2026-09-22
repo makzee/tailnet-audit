@@ -18,10 +18,12 @@ info      homelab-traefik  update-available   client 1.80.0 is out of date
 4 devices audited: 2 critical, 3 warn, 1 info.
 ```
 
-That sample is rendered from fixtures by a test, so it cannot drift from what the code prints.
+That sample is rendered from fixtures rather than typed by hand; regenerate it after changing
+the output with `TAILNET_AUDIT_GEN_SAMPLE=1 go test ./internal/audit -run TestGenerateSample -v`.
 
-**It is read-only by construction.** Every request it makes is a `GET`. There is no code path
-that mutates a tailnet, and the token it needs carries only `devices:core:read`.
+**It is read-only by construction.** Every request it makes is a `GET`, and there is no code
+path that mutates a tailnet. The only permission it actually needs is the `devices:core:read`
+scope — but see [Limitations](#limitations) for what the credential you give it can do.
 
 ## Install
 
@@ -29,8 +31,7 @@ that mutates a tailnet, and the token it needs carries only `devices:core:read`.
 go install github.com/makzee/tailnet-audit/cmd/tailnet-audit@latest
 ```
 
-Create a read-only API access token in the Tailscale admin console under
-**Settings → Keys**, then:
+Generate an API access token in the Tailscale admin console under **Settings → Keys**, then:
 
 ```sh
 export TAILSCALE_API_KEY='tskey-api-...'
@@ -39,6 +40,10 @@ tailnet-audit
 
 The token is read from the environment only. It is deliberately not a flag: flags land in
 shell history and in the process table, where other users on the box can read them.
+
+An API access token has the full API permissions of the user who created it, not just read
+access. This tool only ever uses it for one `GET`, but treat the token as an admin credential:
+give it a short expiry and revoke it when you are done.
 
 ## Usage
 
@@ -96,15 +101,17 @@ was the point of writing it:
 - **Exponential backoff with full jitter** — `rand[0, min(maxDelay, base·2ⁿ))`. Without
   jitter, a fleet of callers that fail together retries together, and the retry storm is
   worse than the original outage.
-- **`Retry-After` wins.** If the server tells you when to come back, your backoff curve is an
-  opinion and theirs is a fact. Both forms RFC 9110 allows are parsed: delay-seconds and
-  HTTP-date.
+- **`Retry-After` replaces the backoff curve.** If the server tells you when to come back,
+  your backoff curve is an opinion and theirs is a fact. Both forms RFC 9110 allows are
+  parsed: delay-seconds and HTTP-date. The one exception is that the wait is capped at the
+  retry policy's `MaxDelay` (5s by default), so a server asking for a minute cannot eat the
+  whole `-timeout`. The cost is that an early retry may simply get another 429.
 - **A client-side rate limiter** bounds outbound requests regardless of what the server
   advertises, so a bug in a loop cannot turn into an accidental denial of service.
 - **Typed errors.** `*APIError` carries the status and the API's own `message`, and unwraps to
   sentinels, so callers write `errors.Is(err, tailscale.ErrNotFound)` instead of matching
-  strings. The CLI uses that to turn a 403 into "the token lacks `devices:core:read`" rather
-  than printing a status code at you.
+  strings. The CLI uses that to turn a 401 into "the token was rejected — check it has not
+  expired" rather than printing a status code at you.
 - **Every body drained and closed**, including the discarded bodies of retried attempts, so
   connections go back to the pool instead of leaking.
 - **Bounded reads.** Response bodies are decoded through an `io.LimitReader`; a wedged proxy
@@ -113,9 +120,10 @@ was the point of writing it:
   the response. One odd field on one device should not cost you the other two hundred.
 - **The token never appears** in a log line or an error message, and there is a test that
   fails if it ever does.
-- **No base-URL override.** The API root is not configurable at runtime, because a flag that
-  redirects an authenticated client at an arbitrary host is a token-exfiltration primitive.
-  The tests reach it through an unexported option instead.
+- **No base-URL flag.** The API root is not configurable from the command line, because a
+  flag that redirects an authenticated client at an arbitrary host is a token-exfiltration
+  primitive. The tests point the client at `httptest` through a `WithBaseURL` option, which
+  lives in an `internal` package, so no code outside this module can call it.
 
 ## Tests
 
@@ -139,11 +147,11 @@ smoke-tested rather than unit-tested.
 
 ## How this was built
 
-I wrote [`SPEC.md`](SPEC.md) first, then implemented it with a coding agent working from that
-document, with the tests as the gate and a fresh-context review pass over the diff before
-committing. Both are in the repository because the review trail is part of the artifact.
+The code was written by an AI coding agent, working from [`SPEC.md`](SPEC.md), with the tests
+as the gate and a separate review pass over the result. The spec is in the repository so you
+can compare what was asked for with what was built.
 
-Two things the review caught that are worth recording, since the interesting part of working
+Two things review caught that are worth recording, since the interesting part of working
 this way is where it goes wrong rather than where it goes right:
 
 1. `Retry-After` was parsed off the response and then dropped on the floor — the header never
@@ -158,8 +166,10 @@ this way is where it goes wrong rather than where it goes right:
 
 - One API call, no pagination: `GET /tailnet/{tailnet}/devices` returns the whole tailnet in
   a single response today. If that ever changes this will need a cursor loop.
-- Personal access tokens only. OAuth client-credentials exchange would be maybe thirty lines
-  more, but a read-only auditor does not need it, and tokens are simpler to scope and revoke.
+- API access tokens only, which is more privilege than a read-only tool should need. An API
+  access token carries its creator's full API permissions and cannot be narrowed. The right
+  credential is an OAuth client scoped to `devices:core:read`: the client-credentials
+  exchange is maybe thirty more lines, and it is the first thing I would add.
 - No policy-file (ACL) analysis. Auditing an ACL properly means evaluating it, not pattern
   matching it, and that is a much larger project than this one.
 
