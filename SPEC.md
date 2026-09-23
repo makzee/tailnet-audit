@@ -1,8 +1,9 @@
 # tailnet-audit — specification
 
 Written before any code. The implementation was produced with a coding agent working from
-this document; the spec is the contract the tests check against, and it is committed so the
-review trail is visible. See README "How this was built".
+this document; the spec is the contract the tests check against. See README "How this was
+built". Amended later when OAuth client-credentials support was added; the OAuth parts below
+date from then.
 
 ## Problem
 
@@ -14,9 +15,10 @@ unauthorized while device approval is on.
 `tailnet-audit` reads a tailnet through the Tailscale API and reports those findings, with an
 exit code you can gate CI or a cron job on.
 
-**Read-only by construction.** The tool issues `GET` requests only. It has no code path that
-mutates a tailnet. The only permission it needs is the `devices:core:read` scope, although
-an API access token cannot be narrowed to that and carries its creator's full permissions.
+**Read-only by construction.** Every API request is a `GET`; the only `POST` is the OAuth
+token exchange. It has no code path that mutates a tailnet. The only permission it needs is
+the `devices:core:read` scope: an OAuth client can be limited to exactly that, while an API
+access token cannot be narrowed and carries its creator's full permissions.
 
 ## Scope
 
@@ -27,8 +29,7 @@ In scope:
 - Emit a table (human) or JSON (machine) report.
 - Exit non-zero when findings reach a configured severity.
 
-Out of scope, deliberately: writing to the API, the policy-file (ACL) endpoints, OAuth
-client-credential exchange (an API access token works, at the cost of over-privilege),
+Out of scope, deliberately: writing to the API, the policy-file (ACL) endpoints,
 persistence, and any kind of daemon mode.
 
 ## API contract
@@ -37,7 +38,9 @@ Source of truth: Tailscale's published OpenAPI document
 (`https://api.tailscale.com/api/v2?outputOpenapiSchema=true`), read 2026-09-22.
 
 - Base URL `https://api.tailscale.com/api/v2`.
-- Auth: HTTP bearer — `Authorization: Bearer <token>`.
+- Auth: HTTP bearer — `Authorization: Bearer <token>`. The token is either an API access
+  token or one issued by `POST /oauth/token` (OAuth client credentials grant, credentials in
+  the form body), valid for an hour.
 - `GET /tailnet/{tailnet}/devices` returns `{"devices": [Device, ...]}`.
 - The path segment `-` means "the default tailnet of the access token", and is the default.
 - `?fields=all` is required: the `default` field set omits `lastSeen`, `expires`,
@@ -98,8 +101,10 @@ tailnet-audit [flags]
   -v                  debug logging to stderr
 ```
 
-The token is read from `TAILSCALE_API_KEY`. It is never accepted as a flag, because flags
-land in shell history and in the process table.
+Credentials are read from `TAILSCALE_OAUTH_CLIENT_ID` and `TAILSCALE_OAUTH_CLIENT_SECRET`
+(preferred), or `TAILSCALE_API_KEY`. OAuth wins if both are set; half an OAuth pair is an
+error. They are never accepted as flags, because flags land in shell history and in the
+process table.
 
 Exit codes: `0` clean, `1` findings at or above `-fail-on`, `2` operational failure (bad
 token, network, cancelled).
