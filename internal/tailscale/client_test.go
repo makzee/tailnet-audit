@@ -12,6 +12,9 @@ import (
 	"time"
 )
 
+// newTestClient aims a client at a stub server and removes the real waiting:
+// backoff still gets computed and asserted on, it just does not cost the suite
+// wall-clock time. The caller supplies the credential.
 func newTestClient(t *testing.T, h http.Handler, opts ...Option) (*Client, *[]time.Duration) {
 	t.Helper()
 	srv := httptest.NewServer(h)
@@ -33,9 +36,7 @@ func newTestClient(t *testing.T, h http.Handler, opts ...Option) (*Client, *[]ti
 	return c, &slept
 }
 
-// newTokenTestClient aims a client at a stub server and removes the real waiting:
-// backoff still gets computed and asserted on, it just does not cost the suite
-// wall-clock time.
+// newTokenTestClient is newTestClient authenticated with an API access token.
 func newTokenTestClient(t *testing.T, h http.Handler, opts ...Option) (*Client, *[]time.Duration) {
 	return newTestClient(t, h, append([]Option{WithToken("tskey-api-test")}, opts...)...)
 }

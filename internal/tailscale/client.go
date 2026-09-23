@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/clientcredentials"
 	"io"
 	"log/slog"
 	"math"
@@ -18,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 	"golang.org/x/time/rate"
 )
 
@@ -90,6 +90,8 @@ func (e *APIError) Retryable() bool {
 	return retryableStatus(e.StatusCode)
 }
 
+// retryableStatus is the one retry rule for every HTTP status this client
+// sees, from the API and from the OAuth token endpoint alike.
 func retryableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code >= 500
 }
@@ -118,8 +120,8 @@ type Client struct {
 	logger  *slog.Logger
 	sleep   func(context.Context, time.Duration) error
 
-	mu     sync.Mutex
-	cached *oauth2.Token
+	mu     sync.Mutex    // guards cached
+	cached *oauth2.Token // last OAuth token, reused until near expiry
 }
 
 // Option configures a Client.
@@ -140,6 +142,10 @@ func WithHTTPClient(h *http.Client) Option {
 	}
 }
 
+// WithOAuth authenticates with an OAuth client's credentials, which can be
+// scoped to devices:core:read, instead of an API access token, which cannot.
+// The config is copied: New fills in the token endpoint and auth style, and
+// must not change the caller's value. A nil config means "not configured".
 func WithOAuth(cfg *clientcredentials.Config) Option {
 	return func(c *Client) {
 		if cfg != nil {
@@ -149,6 +155,8 @@ func WithOAuth(cfg *clientcredentials.Config) Option {
 	}
 }
 
+// WithToken authenticates with an API access token. A blank token is
+// ignored, so New reports it as a missing credential.
 func WithToken(token string) Option {
 	return func(c *Client) {
 		if strings.TrimSpace(token) != "" {
@@ -186,8 +194,9 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// New builds a client. The token is required; it is read from the environment
-// by the caller rather than accepted as a flag.
+// New builds a client. It needs a credential, from WithToken or WithOAuth;
+// given both, OAuth wins. The caller reads credentials from the environment
+// rather than accepting them as flags.
 func New(opts ...Option) (*Client, error) {
 	c := &Client{
 		baseURL: DefaultBaseURL,
@@ -203,16 +212,24 @@ func New(opts ...Option) (*Client, error) {
 
 	switch {
 	case c.oauth != nil:
+		// Derived after the options run, so WithBaseURL moves the token
+		// endpoint too. Tailscale takes the credentials in the form body;
+		// left to auto-detect, oauth2 tries Basic auth first and repeats
+		// every failed request.
 		c.oauth.TokenURL = c.baseURL + "/oauth/token"
 		c.oauth.AuthStyle = oauth2.AuthStyleInParams
-		c.token = ""
+		c.token = "" // OAuth wins when both are given
 	case c.token != "":
 	default:
-		return nil, errors.New("tailscale: no token or oauth creds are supplied")
+		return nil, errors.New("tailscale: no API token or OAuth client credentials supplied")
 	}
 	return c, nil
 }
 
+// accessToken returns the bearer token for one request. Under OAuth it
+// reuses the cached token until it nears expiry, then fetches a new one with
+// the caller's ctx, so cancelling a call also cancels its token request.
+// oauth2's own transport would use a context fixed when the client was built.
 func (c *Client) accessToken(ctx context.Context) (string, error) {
 	if c.oauth == nil {
 		return c.token, nil
@@ -225,12 +242,18 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 		return c.cached.AccessToken, nil
 	}
 
+	// Route the token request through our own client (its timeout, and
+	// WithHTTPClient) rather than oauth2's fallback, http.DefaultClient.
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, c.http)
 	tok, err := c.oauth.Token(ctx)
 	if err != nil {
+		// oauth2 returns a network failure as the bare *url.Error from
+		// http.Client.Do. Wrap it like attempt() wraps API network failures
+		// so it is retried the same way. A *oauth2.RetrieveError keeps its
+		// type and is judged by status in retryable().
 		var urlErr *url.Error
 		if errors.As(err, &urlErr) {
-			return "", &transportError{Path: "/oauth/token", Err: err}
+			return "", &transportError{Method: http.MethodPost, Path: "/oauth/token", Err: err}
 		}
 		return "", err
 	}
@@ -317,7 +340,7 @@ func (c *Client) attempt(ctx context.Context, endpoint, path string, out any) er
 	start := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return &transportError{Path: path, Err: err}
+		return &transportError{Method: http.MethodGet, Path: path, Err: err}
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
@@ -344,12 +367,13 @@ const userAgent = "tailnet-audit/1.0 (+https://github.com/makzee/tailnet-audit)"
 
 // transportError marks a network-level failure, which is always worth retrying.
 type transportError struct {
-	Path string
-	Err  error
+	Method string
+	Path   string
+	Err    error
 }
 
 func (e *transportError) Error() string {
-	return fmt.Sprintf("tailscale: GET %s: %v", e.Path, e.Err)
+	return fmt.Sprintf("tailscale: %s %s: %v", e.Method, e.Path, e.Err)
 }
 func (e *transportError) Unwrap() error { return e.Err }
 

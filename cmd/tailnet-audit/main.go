@@ -1,7 +1,8 @@
 // Command tailnet-audit reports posture problems in a Tailscale tailnet:
 // expired keys, unapproved subnet routes, stale devices, unauthorized nodes.
 //
-// It is read-only. Every request it makes is a GET.
+// It is read-only. Every API request it makes is a GET; the only POST is the
+// OAuth token exchange, which changes nothing in the tailnet.
 package main
 
 import (
@@ -9,7 +10,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"golang.org/x/oauth2/clientcredentials"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -18,6 +18,8 @@ import (
 
 	"github.com/makzee/tailnet-audit/internal/audit"
 	"github.com/makzee/tailnet-audit/internal/tailscale"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 )
 
 // Exit codes are part of the tool's contract: a cron job or CI step reads
@@ -28,9 +30,13 @@ const (
 	exitError    = 2
 )
 
-const tokenEnv = "TAILSCALE_API_KEY"
-const oauthClientIdEnv = "TAILSCALE_OAUTH_CLIENT_ID"
-const oauthClientSecretEnv = "TAILSCALE_OAUTH_CLIENT_SECRET"
+// Credentials come from the environment only: flags land in shell history and
+// in the process table.
+const (
+	tokenEnv             = "TAILSCALE_API_KEY"
+	oauthClientIDEnv     = "TAILSCALE_OAUTH_CLIENT_ID"
+	oauthClientSecretEnv = "TAILSCALE_OAUTH_CLIENT_SECRET"
+)
 
 type options struct {
 	tailnet      string
@@ -58,25 +64,19 @@ func run() int {
 
 	logger := newLogger(opts.verbose)
 
+	cred, err := credential(os.Getenv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "tailnet-audit:", err)
+		return exitError
+	}
+
 	// Ctrl-C cancels the run, including any pending retry backoff.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, opts.timeout)
 	defer cancel()
 
-	id := os.Getenv(oauthClientIdEnv)
-	secret := os.Getenv(oauthClientSecretEnv)
-	var cfg *clientcredentials.Config
-	if id != "" && secret != "" {
-		cfg = &clientcredentials.Config{
-			ClientID:     id,
-			ClientSecret: secret,
-		}
-	}
-
-	token := os.Getenv(tokenEnv)
-
-	client, err := tailscale.New(tailscale.WithLogger(logger), tailscale.WithToken(token), tailscale.WithOAuth(cfg))
+	client, err := tailscale.New(tailscale.WithLogger(logger), cred)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "tailnet-audit:", err)
 		return exitError
@@ -133,7 +133,8 @@ func parseFlags(args []string, errOut *os.File) (options, error) {
 		fmt.Fprintf(errOut, "tailnet-audit — report posture problems in a Tailscale tailnet.\n\n")
 		fmt.Fprintf(errOut, "Usage:\n  tailnet-audit [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
-		fmt.Fprintf(errOut, "\nThe API token is read from %s. Exit codes: 0 clean, 1 findings, 2 error.\n", tokenEnv)
+		fmt.Fprintf(errOut, "\nCredentials are read from %s and %s (preferred), or %s.\nExit codes: 0 clean, 1 findings, 2 error.\n",
+			oauthClientIDEnv, oauthClientSecretEnv, tokenEnv)
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -153,6 +154,24 @@ func parseFlags(args []string, errOut *os.File) (options, error) {
 	return opts, nil
 }
 
+// credential picks the API credential from the environment. An OAuth client
+// wins over an API access token because it can be scoped to read-only. Half
+// an OAuth pair is a mistake, not a reason to fall back silently.
+func credential(getenv func(string) string) (tailscale.Option, error) {
+	id, secret := getenv(oauthClientIDEnv), getenv(oauthClientSecretEnv)
+	switch {
+	case id != "" && secret != "":
+		return tailscale.WithOAuth(&clientcredentials.Config{ClientID: id, ClientSecret: secret}), nil
+	case id != "" || secret != "":
+		return nil, fmt.Errorf("set both %s and %s, or neither", oauthClientIDEnv, oauthClientSecretEnv)
+	}
+	if token := getenv(tokenEnv); token != "" {
+		return tailscale.WithToken(token), nil
+	}
+	return nil, fmt.Errorf("no credentials: set %s and %s (an OAuth client with the devices:core:read scope), or %s",
+		oauthClientIDEnv, oauthClientSecretEnv, tokenEnv)
+}
+
 func newLogger(verbose bool) *slog.Logger {
 	level := slog.LevelWarn
 	if verbose {
@@ -164,11 +183,14 @@ func newLogger(verbose bool) *slog.Logger {
 // explain turns the client's typed errors into something a person can act on
 // without reading the source.
 func explain(err error) string {
+	var rErr *oauth2.RetrieveError
 	switch {
+	case errors.As(err, &rErr) && rErr.Response != nil && rErr.Response.StatusCode < 500:
+		return fmt.Sprintf("the OAuth client was rejected — check %s and %s: %v", oauthClientIDEnv, oauthClientSecretEnv, err)
 	case errors.Is(err, tailscale.ErrUnauthorized):
 		return fmt.Sprintf("the API token was rejected — check %s (tokens expire after at most 90 days): %v", tokenEnv, err)
 	case errors.Is(err, tailscale.ErrForbidden):
-		return fmt.Sprintf("the token lacks permission to read devices (needs the devices:core:read scope): %v", err)
+		return fmt.Sprintf("not allowed to read devices — an OAuth client needs the devices:core:read scope: %v", err)
 	case errors.Is(err, tailscale.ErrNotFound):
 		return fmt.Sprintf("no such tailnet — check -tailnet, or use \"-\" for the token's own: %v", err)
 	case errors.Is(err, context.DeadlineExceeded):
