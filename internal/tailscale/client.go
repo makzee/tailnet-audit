@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 	"io"
 	"log/slog"
 	"math"
@@ -13,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -84,7 +87,11 @@ func (e *APIError) Unwrap() error {
 // succeed. 429 and 5xx qualify; every other 4xx is the caller's fault and
 // retrying it only burns quota.
 func (e *APIError) Retryable() bool {
-	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+	return retryableStatus(e.StatusCode)
+}
+
+func retryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
 }
 
 // RetryPolicy bounds how hard the client tries before giving up.
@@ -104,11 +111,15 @@ func DefaultRetryPolicy() RetryPolicy {
 type Client struct {
 	baseURL string
 	token   string
+	oauth   *clientcredentials.Config
 	http    *http.Client
 	limiter *rate.Limiter
 	retry   RetryPolicy
 	logger  *slog.Logger
 	sleep   func(context.Context, time.Duration) error
+
+	mu     sync.Mutex
+	cached *oauth2.Token
 }
 
 // Option configures a Client.
@@ -125,6 +136,23 @@ func WithHTTPClient(h *http.Client) Option {
 	return func(c *Client) {
 		if h != nil {
 			c.http = h
+		}
+	}
+}
+
+func WithOAuth(cfg *clientcredentials.Config) Option {
+	return func(c *Client) {
+		if cfg != nil {
+			cp := *cfg
+			c.oauth = &cp
+		}
+	}
+}
+
+func WithToken(token string) Option {
+	return func(c *Client) {
+		if strings.TrimSpace(token) != "" {
+			c.token = token
 		}
 	}
 }
@@ -160,13 +188,9 @@ func WithLogger(l *slog.Logger) Option {
 
 // New builds a client. The token is required; it is read from the environment
 // by the caller rather than accepted as a flag.
-func New(token string, opts ...Option) (*Client, error) {
-	if strings.TrimSpace(token) == "" {
-		return nil, errors.New("tailscale: api token is empty")
-	}
+func New(opts ...Option) (*Client, error) {
 	c := &Client{
 		baseURL: DefaultBaseURL,
-		token:   token,
 		http:    &http.Client{Timeout: 15 * time.Second},
 		limiter: rate.NewLimiter(rate.Limit(5), 5),
 		retry:   DefaultRetryPolicy(),
@@ -176,7 +200,42 @@ func New(token string, opts ...Option) (*Client, error) {
 	for _, opt := range opts {
 		opt(c)
 	}
+
+	switch {
+	case c.oauth != nil:
+		c.oauth.TokenURL = c.baseURL + "/oauth/token"
+		c.oauth.AuthStyle = oauth2.AuthStyleInParams
+		c.token = ""
+	case c.token != "":
+	default:
+		return nil, errors.New("tailscale: no token or oauth creds are supplied")
+	}
 	return c, nil
+}
+
+func (c *Client) accessToken(ctx context.Context) (string, error) {
+	if c.oauth == nil {
+		return c.token, nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.cached.Valid() {
+		return c.cached.AccessToken, nil
+	}
+
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, c.http)
+	tok, err := c.oauth.Token(ctx)
+	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return "", &transportError{Path: "/oauth/token", Err: err}
+		}
+		return "", err
+	}
+	c.cached = tok
+	return tok.AccessToken, nil
 }
 
 // ListDevices returns every device in the tailnet. Pass DefaultTailnet ("-")
@@ -243,11 +302,15 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, out any
 // attempt performs exactly one request/response cycle, always draining and
 // closing the body so the connection goes back to the pool.
 func (c *Client) attempt(ctx context.Context, endpoint, path string, out any) error {
+	token, err := c.accessToken(ctx)
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("tailscale: build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", userAgent)
 
@@ -294,6 +357,10 @@ func retryable(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		return apiErr.Retryable()
+	}
+	var rErr *oauth2.RetrieveError
+	if errors.As(err, &rErr) {
+		return rErr.Response == nil || retryableStatus(rErr.Response.StatusCode)
 	}
 	var transErr *transportError
 	return errors.As(err, &transErr)

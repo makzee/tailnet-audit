@@ -12,9 +12,6 @@ import (
 	"time"
 )
 
-// newTestClient aims a client at a stub server and removes the real waiting:
-// backoff still gets computed and asserted on, it just does not cost the suite
-// wall-clock time.
 func newTestClient(t *testing.T, h http.Handler, opts ...Option) (*Client, *[]time.Duration) {
 	t.Helper()
 	srv := httptest.NewServer(h)
@@ -25,7 +22,7 @@ func newTestClient(t *testing.T, h http.Handler, opts ...Option) (*Client, *[]ti
 		WithBaseURL(srv.URL),
 		WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 4 * time.Millisecond}),
 	}
-	c, err := New("tskey-api-test", append(base, opts...)...)
+	c, err := New(append(base, opts...)...)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -34,6 +31,13 @@ func newTestClient(t *testing.T, h http.Handler, opts ...Option) (*Client, *[]ti
 		return ctx.Err()
 	}
 	return c, &slept
+}
+
+// newTokenTestClient aims a client at a stub server and removes the real waiting:
+// backoff still gets computed and asserted on, it just does not cost the suite
+// wall-clock time.
+func newTokenTestClient(t *testing.T, h http.Handler, opts ...Option) (*Client, *[]time.Duration) {
+	return newTestClient(t, h, append([]Option{WithToken("tskey-api-test")}, opts...)...)
 }
 
 func devicesJSON(body string) http.HandlerFunc {
@@ -45,7 +49,7 @@ func devicesJSON(body string) http.HandlerFunc {
 
 func TestListDevices_RequestShape(t *testing.T) {
 	var gotPath, gotQuery, gotAuth, gotAccept string
-	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c, _ := newTokenTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
 		gotAuth, gotAccept = r.Header.Get("Authorization"), r.Header.Get("Accept")
 		fmt.Fprint(w, `{"devices":[]}`)
@@ -71,7 +75,7 @@ func TestListDevices_RequestShape(t *testing.T) {
 }
 
 func TestListDevices_DecodesDevices(t *testing.T) {
-	c, _ := newTestClient(t, devicesJSON(`{"devices":[
+	c, _ := newTokenTestClient(t, devicesJSON(`{"devices":[
 		{"id":"1","hostname":"alpha","lastSeen":"2026-09-01T10:00:00Z","expires":"2026-12-01T10:00:00Z",
 		 "authorized":true,"tags":["tag:server"],"advertisedRoutes":["10.0.0.0/24"],"enabledRoutes":[]},
 		{"id":"2","hostname":"beta","expires":"","keyExpiryDisabled":true}
@@ -98,7 +102,7 @@ func TestListDevices_DecodesDevices(t *testing.T) {
 }
 
 func TestListDevices_UnknownFieldsIgnored(t *testing.T) {
-	c, _ := newTestClient(t, devicesJSON(`{"devices":[{"id":"1","hostname":"a","somethingNew":{"x":1}}],"nextPage":"x"}`))
+	c, _ := newTokenTestClient(t, devicesJSON(`{"devices":[{"id":"1","hostname":"a","somethingNew":{"x":1}}],"nextPage":"x"}`))
 	got, err := c.ListDevices(context.Background(), "-")
 	if err != nil {
 		t.Fatalf("a new server-side field broke the client: %v", err)
@@ -110,7 +114,7 @@ func TestListDevices_UnknownFieldsIgnored(t *testing.T) {
 
 func TestListDevices_DefaultsTailnetToDash(t *testing.T) {
 	var gotPath string
-	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c, _ := newTokenTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		fmt.Fprint(w, `{"devices":[]}`)
 	}))
@@ -135,7 +139,7 @@ func TestStatusMapsToSentinel(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, _ := newTokenTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(tt.status)
 				fmt.Fprint(w, tt.body)
 			}))
@@ -161,7 +165,7 @@ func TestStatusMapsToSentinel(t *testing.T) {
 
 func TestNonRetryableStatusIsNotRetried(t *testing.T) {
 	var calls atomic.Int32
-	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c, _ := newTokenTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, `{"message":"bad request"}`)
@@ -177,7 +181,7 @@ func TestNonRetryableStatusIsNotRetried(t *testing.T) {
 
 func TestRetriesServerErrorThenSucceeds(t *testing.T) {
 	var calls atomic.Int32
-	c, slept := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c, slept := newTokenTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprint(w, `{"message":"boom"}`)
@@ -208,7 +212,7 @@ func TestRetriesServerErrorThenSucceeds(t *testing.T) {
 
 func TestRetryAfterHeaderOverridesBackoff(t *testing.T) {
 	var calls atomic.Int32
-	c, slept := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c, slept := newTokenTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
 			w.Header().Set("Retry-After", "2")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -233,7 +237,7 @@ func TestRetryAfterHeaderOverridesBackoff(t *testing.T) {
 
 func TestRetryExhaustionReturnsLastError(t *testing.T) {
 	var calls atomic.Int32
-	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c, _ := newTokenTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprint(w, `{"message":"unavailable"}`)
@@ -253,7 +257,7 @@ func TestRetryExhaustionReturnsLastError(t *testing.T) {
 
 func TestCancelledContextStopsImmediately(t *testing.T) {
 	var calls atomic.Int32
-	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c, _ := newTokenTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -271,14 +275,14 @@ func TestCancelledContextStopsImmediately(t *testing.T) {
 }
 
 func TestMalformedBodyIsAnError(t *testing.T) {
-	c, _ := newTestClient(t, devicesJSON(`{"devices":[{"id":`))
+	c, _ := newTokenTestClient(t, devicesJSON(`{"devices":[{"id":`))
 	if _, err := c.ListDevices(context.Background(), "-"); err == nil {
 		t.Fatal("expected a decode error on a truncated body")
 	}
 }
 
 func TestEmptyTokenRejected(t *testing.T) {
-	if _, err := New("   "); err == nil {
+	if _, err := New(WithToken("   ")); err == nil {
 		t.Fatal("expected New to reject a blank token")
 	}
 }
@@ -291,7 +295,7 @@ func TestErrorStringNeverLeaksToken(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c, err := New(token, WithBaseURL(srv.URL), WithRetryPolicy(RetryPolicy{MaxAttempts: 1}))
+	c, err := New(WithBaseURL(srv.URL), WithToken(token), WithRetryPolicy(RetryPolicy{MaxAttempts: 1}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

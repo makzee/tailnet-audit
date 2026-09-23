@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"golang.org/x/oauth2/clientcredentials"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -28,6 +29,8 @@ const (
 )
 
 const tokenEnv = "TAILSCALE_API_KEY"
+const oauthClientIdEnv = "TAILSCALE_OAUTH_CLIENT_ID"
+const oauthClientSecretEnv = "TAILSCALE_OAUTH_CLIENT_SECRET"
 
 type options struct {
 	tailnet      string
@@ -55,21 +58,25 @@ func run() int {
 
 	logger := newLogger(opts.verbose)
 
-	token := os.Getenv(tokenEnv)
-	if token == "" {
-		fmt.Fprintf(os.Stderr,
-			"tailnet-audit: %s is not set.\nCreate a read-only API access token in the Tailscale admin console and export it.\n",
-			tokenEnv)
-		return exitError
-	}
-
 	// Ctrl-C cancels the run, including any pending retry backoff.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, opts.timeout)
 	defer cancel()
 
-	client, err := tailscale.New(token, tailscale.WithLogger(logger))
+	id := os.Getenv(oauthClientIdEnv)
+	secret := os.Getenv(oauthClientSecretEnv)
+	var cfg *clientcredentials.Config
+	if id != "" && secret != "" {
+		cfg = &clientcredentials.Config{
+			ClientID:     id,
+			ClientSecret: secret,
+		}
+	}
+
+	token := os.Getenv(tokenEnv)
+
+	client, err := tailscale.New(tailscale.WithLogger(logger), tailscale.WithToken(token), tailscale.WithOAuth(cfg))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "tailnet-audit:", err)
 		return exitError
