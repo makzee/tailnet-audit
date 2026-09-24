@@ -1,8 +1,7 @@
 # tailnet-audit — specification
 
-Written before any code. The implementation was produced with a coding agent working from
-this document; the spec is the contract the tests check against. See README "How this was
-built". Amended later when OAuth client-credentials support was added; the OAuth parts below
+Written before any code, by the coding agent that then implemented it from this document;
+the spec is the contract the tests check against. See README "How this was built". Amended later when OAuth client-credentials support was added; the OAuth parts below
 date from then.
 
 ## Problem

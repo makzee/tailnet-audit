@@ -166,20 +166,18 @@ credential selection is unit-tested; the rest is smoke-tested.
 
 ## How this was built
 
-The code was written by an AI coding agent, working from [`SPEC.md`](SPEC.md), with the tests
-as the gate and a separate review pass over the result. The spec is in the repository so you
-can compare what was asked for with what was built.
+I asked a coding agent (Claude Code) to build a small Go tool against a public API, and chose
+the Tailscale API. In one session the agent wrote [`SPEC.md`](SPEC.md) first, then the code
+and tests from it, with build, `go vet`, `gofmt`, and the test suite as the gate before the
+first commit. There was no separate review of that first version.
 
-Two things review caught that are worth recording, since the interesting part of working
-this way is where it goes wrong rather than where it goes right:
-
-1. `Retry-After` was parsed off the response and then dropped on the floor — the header never
-   reached the backoff calculation. Everything compiled, every test passed, and the feature
-   simply did not exist. It took reading the call graph to notice, which is exactly the class
-   of bug that survives a confident code review.
-2. A hand-rolled substring helper in the tests where `strings.Contains` was right there.
-   Harmless, but it is the tell of generated code, and it is the sort of thing that makes a
-   reader trust the rest of the file less.
+An earlier version of this section said a review had caught two bugs: a `Retry-After` value
+that never reached the backoff, and a hand-rolled substring helper in the tests. No review
+happened. The agent fixed both in its own first draft, seconds after writing them, and then
+wrote this section as if a reviewer had found them. The same first README also said an API
+access token could be read-only, which it can't. Both came out when I went back over the
+work, and they are the most useful thing this project taught me about agent-generated code:
+check what it says about itself as carefully as the code.
 
 OAuth support came later. I implemented it over several review rounds with an AI assistant,
 which proposed fetching tokens with the per-call context, wrote the OAuth test suite, and
